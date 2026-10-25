@@ -1,20 +1,38 @@
 // Talking Stick bot: when someone starts speaking, everyone else in the
 // voice channel is server-muted until that person stops talking.
 
-const { Client, GatewayIntentBits, PermissionFlagsBits } = require('discord.js');
+const {
+  Client,
+  GatewayIntentBits,
+  PermissionFlagsBits,
+  SlashCommandBuilder,
+  InteractionContextType,
+  MessageFlags,
+} = require('discord.js');
 const { joinVoiceChannel, entersState, VoiceConnectionStatus } = require('@discordjs/voice');
 
 // ---- Settings you can tweak ----
-const PREFIX = '!stick';
 const SILENCE_MS = 1500;   // how long the speaker must be quiet before everyone is unmuted
 const MAX_TURN_MS = 60000; // longest one person can hold the floor (set to 0 for no limit)
+
+// The slash commands that show up when you type "/" in Discord
+const commands = [
+  new SlashCommandBuilder()
+    .setName('stick')
+    .setDescription('Talking stick: only one person can talk at a time')
+    .addSubcommand((sub) =>
+      sub.setName('start').setDescription('Join your voice channel and start the talking stick'))
+    .addSubcommand((sub) =>
+      sub.setName('stop').setDescription('Unmute everyone and leave the voice channel'))
+    // Only people with Mute Members can see and use these commands
+    .setDefaultMemberPermissions(PermissionFlagsBits.MuteMembers)
+    .setContexts(InteractionContextType.Guild),
+];
 
 const client = new Client({
   intents: [
     GatewayIntentBits.Guilds,
     GatewayIntentBits.GuildVoiceStates,
-    GatewayIntentBits.GuildMessages,
-    GatewayIntentBits.MessageContent,
   ],
 });
 
@@ -85,20 +103,29 @@ async function endSession(guildId) {
   }
 }
 
-async function startSession(msg) {
-  const channel = msg.member.voice.channel;
-  if (!channel) return msg.reply('Join a voice channel first, then run this again.');
-  if (sessions.has(msg.guild.id)) return msg.reply(`Already running. Use \`${PREFIX} stop\` first.`);
+// Replies only the person who ran the command can see
+function privateReply(interaction, content) {
+  return interaction.reply({ content, flags: MessageFlags.Ephemeral });
+}
 
-  const perms = channel.permissionsFor(msg.guild.members.me);
+async function startSession(interaction) {
+  const guild = interaction.guild;
+  const channel = interaction.member.voice.channel;
+  if (!channel) return privateReply(interaction, 'Join a voice channel first, then run this again.');
+  if (sessions.has(guild.id)) return privateReply(interaction, 'Already running. Use `/stick stop` first.');
+
+  const perms = channel.permissionsFor(guild.members.me);
   if (!perms.has([PermissionFlagsBits.Connect, PermissionFlagsBits.MuteMembers])) {
-    return msg.reply('I need the **Connect** and **Mute Members** permissions in that channel.');
+    return privateReply(interaction, 'I need the **Connect** and **Mute Members** permissions in that channel.');
   }
+
+  // Connecting can take longer than Discord's 3-second reply limit, so reply "thinking..." first
+  await interaction.deferReply();
 
   const connection = joinVoiceChannel({
     channelId: channel.id,
-    guildId: msg.guild.id,
-    adapterCreator: msg.guild.voiceAdapterCreator,
+    guildId: guild.id,
+    adapterCreator: guild.voiceAdapterCreator,
     selfDeaf: false, // must NOT be deafened, or the bot can't hear who is talking
     selfMute: true,
   });
@@ -107,11 +134,11 @@ async function startSession(msg) {
     await entersState(connection, VoiceConnectionStatus.Ready, 20000);
   } catch {
     connection.destroy();
-    return msg.reply("Couldn't connect to the voice channel.");
+    return interaction.editReply("Couldn't connect to the voice channel.");
   }
 
   const session = {
-    guild: msg.guild,
+    guild,
     channelId: channel.id,
     connection,
     speaker: null,
@@ -120,7 +147,7 @@ async function startSession(msg) {
     turnTimer: null,
     queue: Promise.resolve(),
   };
-  sessions.set(msg.guild.id, session);
+  sessions.set(guild.id, session);
 
   const speaking = connection.receiver.speaking;
 
@@ -150,11 +177,11 @@ async function startSession(msg) {
         entersState(connection, VoiceConnectionStatus.Connecting, 5000),
       ]);
     } catch {
-      endSession(msg.guild.id);
+      endSession(guild.id);
     }
   });
 
-  msg.reply(`Talking stick is on in **${channel.name}**. Whoever speaks first has the floor.`);
+  interaction.editReply(`Talking stick is on in **${channel.name}**. Whoever speaks first has the floor.`);
 }
 
 client.on('voiceStateUpdate', (oldState, newState) => {
@@ -194,22 +221,21 @@ client.on('voiceStateUpdate', (oldState, newState) => {
   }
 });
 
-client.on('messageCreate', async (msg) => {
-  if (msg.author.bot || !msg.guild || !msg.content.startsWith(PREFIX)) return;
+client.on('interactionCreate', async (interaction) => {
+  if (!interaction.isChatInputCommand() || interaction.commandName !== 'stick') return;
 
-  // Only people who could mute members themselves can control the bot
-  if (!msg.member.permissions.has(PermissionFlagsBits.MuteMembers)) {
-    return msg.reply('You need the Mute Members permission to use this.');
+  try {
+    const sub = interaction.options.getSubcommand();
+    if (sub === 'start') return await startSession(interaction);
+    if (sub === 'stop') {
+      if (!sessions.has(interaction.guild.id)) return privateReply(interaction, "I'm not running right now.");
+      await interaction.deferReply();
+      await endSession(interaction.guild.id);
+      return interaction.editReply('Talking stick is off. Everyone has been unmuted.');
+    }
+  } catch (err) {
+    console.error(err);
   }
-
-  const cmd = msg.content.slice(PREFIX.length).trim().toLowerCase();
-  if (cmd === 'start') return startSession(msg);
-  if (cmd === 'stop') {
-    if (!sessions.has(msg.guild.id)) return msg.reply("I'm not running right now.");
-    await endSession(msg.guild.id);
-    return msg.reply('Talking stick is off. Everyone has been unmuted.');
-  }
-  msg.reply(`Commands: \`${PREFIX} start\` and \`${PREFIX} stop\``);
 });
 
 // Unmute everyone if you stop the bot with Ctrl+C
@@ -221,5 +247,14 @@ async function shutdown() {
 process.on('SIGINT', shutdown);
 process.on('SIGTERM', shutdown);
 
-client.once('clientReady', () => console.log(`Logged in as ${client.user.tag}`));
+client.once('clientReady', async () => {
+  console.log(`Logged in as ${client.user.tag}`);
+  // Tell Discord about the slash commands so they show up in the "/" menu
+  try {
+    await client.application.commands.set(commands);
+    console.log('Slash commands registered.');
+  } catch (err) {
+    console.error('Failed to register slash commands:', err);
+  }
+});
 client.login(process.env.DISCORD_TOKEN);
