@@ -1,0 +1,13 @@
+# Dependencies
+node_modules/
+
+# keys
+.env
+
+# Logs
+npm-debug.log*
+*.log
+
+# junk
+.DS_Store
+Thumbs.db
